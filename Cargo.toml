@@ -8,3 +8,8 @@ edition = "2021"
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 mini-redis = "0.4"
+bytes = "1"
+# The goal of Bytes from the bytes crate is to provide a robust byte array structure for network programming.
+# The biggest feature it adds over Vec<u8> is shallow cloning. In other words, calling clone() on a Bytes instance
+# does not copy the underlying data. Instead, a Bytes instance is a reference-counted handle to some underlying data.
+# The Bytes type is roughly an Arc<Vec<u8>> but with some added capabilities.

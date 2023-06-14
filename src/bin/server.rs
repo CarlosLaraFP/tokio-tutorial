@@ -1,5 +1,47 @@
 use tokio::net::{TcpListener, TcpStream};
 use mini_redis::{Connection, Frame};
+use bytes::Bytes;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+/*
+    Arc is a thread-safe reference-counting pointer. 'Arc' stands for 'Atomically Reference Counted'.
+    The type Arc<T> provides shared ownership of a value of type T, allocated in the heap.
+    The HashMap will be shared across many tasks and potentially many threads.
+    To support this, it is wrapped in Arc<Mutex<_>>
+
+    Arc allows data to be safely shared across multiple threads by ensuring that the data it points
+    to is not deallocated until all references to it are out of scope. Arc accomplishes this with
+    atomic reference counting, which means that it can safely increment and decrement the reference
+    count even in a multithreaded context. Mutex provides mutual exclusion, meaning that at any
+    given time, only one thread can modify the data inside the Mutex. This ensures that when
+    multiple threads are attempting to access the same data, they won't cause data races. However,
+    Mutex itself does not have the ability to be shared across multiple threads. It cannot be
+    safely sent across threads or tasks without being wrapped in an Arc.
+
+    As a rule of thumb, using a synchronous mutex from within asynchronous code is fine as long as
+    contention remains low and the lock is not held across calls to .await. Additionally, consider
+    using parking_lot::Mutex as a faster alternative to std::sync::Mutex
+ */
+type Db = Arc<Mutex<HashMap<String, Bytes>>>;
+/*
+    Using a blocking mutex to guard short critical sections is an acceptable strategy when
+    contention is minimal. When a lock is contended, the thread executing the task must block
+    and wait on the mutex. This will not only block the current task but it will also block all
+    other tasks scheduled on the current thread. In our case, as each key is independent,
+    mutex sharding solves the issue. To do this, instead of having a single Mutex<HashMap<_, _>>
+    instance, we introduce N distinct instances. The dashmap crate provides an implementation
+    of a more sophisticated sharded hash map.
+ */
+type ShardedDb = Arc<Vec<Mutex<HashMap<String, Vec<u8>>>>>;
+
+fn new_sharded_db(num_shards: usize) -> ShardedDb {
+    let mut db = Vec::with_capacity(num_shards);
+    for _ in 0..num_shards {
+        db.push(Mutex::new(HashMap::new()));
+    }
+    Arc::new(db)
+}
+
 
 #[tokio::main]
 async fn main() {
@@ -8,6 +50,15 @@ async fn main() {
         by binding tokio::net::TcpListener to port 6379 (bind the listener to the address).
      */
     let listener = TcpListener::bind("127.0.0.1:6379").await.unwrap();
+
+    println!("Listening on 127.0.0.1:6379");
+
+    /*
+        Using Arc allows the HashMap to be referenced concurrently from many tasks, potentially
+        running on many threads. Mutex guards the HashMap. Throughout Tokio, the term handle is
+        used to reference a value that provides access to some shared state.
+     */
+    let db = Arc::new(Mutex::new(HashMap::new()));
 
     /*
         Then the sockets are accepted in a loop. Each socket is processed then closed.
@@ -40,10 +91,15 @@ async fn main() {
     loop {
         let (socket, _) = listener.accept().await.unwrap();
 
+        // Clone the handle to the hash map.
+        let db = db.clone();
+
+        println!("Connection accepted");
+
         // When variables are referenced inside an async block, they're borrowed. Therefore,
         // connections must be moved, otherwise they don't live long enough (loop end = context end).
         tokio::spawn(async move {
-            process(socket).await;
+            process(socket, db).await;
         });
 
         //println!("{:?}", socket); // value borrowed after move compilation error
@@ -81,37 +137,38 @@ async fn main() {
     reuse or deallocate the buffer memory. The specific timing of when this happens can
     depend on the details of the application and the networking library or framework being used.
  */
-async fn process(socket: TcpStream) {
+async fn process(socket: TcpStream, db: Db) {
+    /*
+        This function takes the shared handle to the HashMap as an argument.
+        It also needs to lock the HashMap before using it.
+        The value's type for the HashMap is now Bytes (which we can cheaply clone).
+     */
     use mini_redis::Command::{self, Get, Set};
-    use std::collections::HashMap;
 
-    // A hashmap is used to store data
-    let mut db = HashMap::new();
-
-    // Connection, provided by `mini-redis`, handles parsing frames from
-    // the socket
+    // Connection, provided by `mini-redis`, handles parsing frames from the socket
     let mut connection = Connection::new(socket);
 
     // Use `read_frame` to receive a command from the connection.
     while let Some(frame) = connection.read_frame().await.unwrap() {
         let response = match Command::from_frame(frame).unwrap() {
             Set(cmd) => {
-                // The value is stored as `Vec<u8>`
-                db.insert(cmd.key().to_string(), cmd.value().to_vec());
+                let mut db = db.lock().unwrap();
+                db.insert(cmd.key().to_string(), cmd.value().clone());
                 Frame::Simple("OK".to_string())
             }
             Get(cmd) => {
+                let db = db.lock().unwrap();
+                // `Frame::Bulk` expects data to be of type `Bytes`
                 if let Some(value) = db.get(cmd.key()) {
-                    // `Frame::Bulk` expects data to be of type `Bytes`. This
-                    // type will be covered later in the tutorial. For now,
-                    // `&Vec<u8>` is converted to `Bytes` using `into()`.
-                    Frame::Bulk(value.clone().into())
+                    Frame::Bulk(value.clone())
                 } else {
                     Frame::Null
                 }
             }
             cmd => panic!("unimplemented {:?}", cmd),
         };
+
+        // the Mutex doesn't need to be unlocked/released manually due to Rust scopes
 
         // Write the response to the client
         connection.write_frame(&response).await.unwrap();
